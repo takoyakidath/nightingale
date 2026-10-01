@@ -19,14 +19,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+HASH_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def is_safe_hash(value):
-    """True when `value` is a bare 64-char lowercase hex blake3 digest --
-    the only shape a real Nightingale file hash ever takes. Rejecting
-    anything else is what keeps every filesystem path built from a URL
-    segment inside the workdir (no `/`, no `..`, no empty string matches)."""
+    """True when `value` is a bare 32-char lowercase hex digest -- the only
+    shape a real Nightingale file hash ever takes (song.rs truncates the
+    blake3 digest's hex to its first 32 characters). Rejecting anything else
+    is what keeps every filesystem path built from a URL segment inside the
+    workdir (no `/`, no `..`, no empty string matches)."""
     return bool(HASH_RE.fullmatch(value or ""))
 
 

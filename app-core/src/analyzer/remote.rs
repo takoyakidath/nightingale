@@ -363,7 +363,10 @@ mod http_tests {
     use std::sync::{Arc, Mutex};
     use tiny_http::{Method, Response, Server};
 
-    const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab1";
+    // Nightingale truncates blake3's hex digest to 32 chars (song.rs); using
+    // a realistic length here, though is_safe_result_filename itself is
+    // length-agnostic (prefix + no-traversal only).
+    const HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12";
 
     fn fake_bridge(token: &'static str) -> (RemoteConfig, Arc<Server>) {
         let server = Arc::new(Server::http("127.0.0.1:0").unwrap());

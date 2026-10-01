@@ -14,11 +14,11 @@ from remote_server import (
     start_http_bridge,
 )
 
-HASH = "ab12" * 16  # 64 hex chars
+HASH = "ab12" * 8  # 32 hex chars -- song.rs truncates blake3's hex to 32 chars
 
 
 class SafetyChecksTest(unittest.TestCase):
-    def test_is_safe_hash_accepts_64_lowercase_hex(self):
+    def test_is_safe_hash_accepts_32_lowercase_hex(self):
         self.assertTrue(is_safe_hash(HASH))
 
     def test_is_safe_hash_rejects_bad_shapes(self):
@@ -159,7 +159,7 @@ class HttpBridgeTest(unittest.TestCase):
         return urllib.request.urlopen(req)
 
     def test_upload_and_download_round_trip(self):
-        file_hash = "cd34" * 16
+        file_hash = "cd34" * 8
         self._request("PUT", f"/sources/{file_hash}?ext=mp3", body=b"audio bytes")
         self.assertEqual(
             self.workdir.find_source(file_hash).read_bytes(), b"audio bytes"
@@ -182,13 +182,13 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIsNone(self.workdir.find_source(file_hash))
 
     def test_missing_token_is_rejected(self):
-        file_hash = "ef56" * 16
+        file_hash = "ef56" * 8
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._request("PUT", f"/sources/{file_hash}?ext=mp3", body=b"x", token=None)
         self.assertEqual(ctx.exception.code, 401)
 
     def test_wrong_token_is_rejected(self):
-        file_hash = "ef56" * 16
+        file_hash = "ef56" * 8
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._request(
                 "PUT", f"/sources/{file_hash}?ext=mp3", body=b"x", token="wrong"
@@ -210,7 +210,7 @@ class HttpBridgeTest(unittest.TestCase):
         # ".." segments push this past the 3-part /results/<hash>/<name>
         # shape, so it 404s instead of 400ing -- the file is still never
         # read because the handler never reaches is_safe_result_filename().
-        file_hash = "ef56" * 16
+        file_hash = "ef56" * 8
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._request("GET", f"/results/{file_hash}/../../etc/passwd")
         self.assertEqual(ctx.exception.code, 404)
@@ -220,7 +220,7 @@ class HttpBridgeTest(unittest.TestCase):
         # silently truncated file on disk. urllib always sends the full body
         # it was given, so this needs a raw socket that claims a
         # Content-Length larger than what it actually sends.
-        file_hash = "9a8b" * 16
+        file_hash = "9a8b" * 8
         conn = socket.create_connection(("127.0.0.1", self.port), timeout=5)
         request_head = (
             f"PUT /sources/{file_hash}?ext=mp3 HTTP/1.1\r\n"
