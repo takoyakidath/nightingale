@@ -173,9 +173,15 @@ are already dependencies. Python side uses only the stdlib
   (independent of `skip_transcription` — see §5.2's three `PUT` cases) — via
   the HTTP bridge;
   and a post-step after `Done`: fetch the manifest, download every listed
-  file into the local `CacheDir`, then `DELETE /work/<hash>`. On upload or
-  download failure, treat it like a server crash (same retry-once-then-fail
-  path that already exists for OOM/crash).
+  file into the local `CacheDir`, then `DELETE /work/<hash>`. Upload and
+  download failures fail the job immediately (`Failed(String)` queue status,
+  with `DELETE /work/<hash>` still attempted best-effort on a download
+  failure) rather than being folded into the existing crash/OOM
+  retry-once loop — that loop exists specifically to recover a crashed
+  *control connection*, a different failure mode from a file-transfer error,
+  and conflating the two would add retry-safety reasoning (is it safe to
+  re-upload a partially-written file? re-download a partially-fetched one?)
+  for a problem a manual re-trigger from the UI already solves.
 - `run_key_pass()` (LRC key-only pass) gets the same upload/download wrapper
   since it also calls `send_and_monitor`.
 - No changes to `cache.rs`, `library_db/*`, `playback.rs`, or any Tauri
@@ -239,8 +245,10 @@ Token: operator-generated, e.g. `python3 -c "import secrets; print(secrets.token
 - OOM detection (`kind:"oom"`) is unaffected — `whisper_compat.is_oom()` and
   MPS are already exercised by the existing bootstrap's `detect_gpu()`
   macOS-arm64 branch.
-- Upload/download failures retry once (mirrors the existing crash-retry loop
-  in `process_song()`), then surface as `Failed`.
+- Upload/download failures surface as `Failed` immediately (no automatic
+  retry — see §6's note on why this is intentionally separate from the
+  crash/OOM retry loop). The user can re-trigger analysis from the UI,
+  which re-uploads from scratch.
 
 ## 10. Testing plan
 
