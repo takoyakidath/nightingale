@@ -1259,6 +1259,14 @@ fn run_key_pass(
     });
     let json_str = serde_json::to_string(&cmd_json)?;
 
+    let remote_cfg = match remote::resolve_mode()? {
+        remote::AnalyzerMode::Remote(cfg) => Some(cfg),
+        remote::AnalyzerMode::Local => None,
+    };
+    if let Some(cfg) = &remote_cfg {
+        remote::upload_song_inputs(cfg, file_hash, local_path, None, cache)?;
+    }
+
     let mut retried = false;
     loop {
         let mut guard = lock_unpoisoned(&ANALYZER_SERVER);
@@ -1268,7 +1276,14 @@ fn run_key_pass(
             .ok_or_else(|| NightingaleError::Other("analyzer server unavailable".into()))?;
         // `None` progress hash keeps this off the status pipe (no queue rows).
         match send_and_monitor(server, &json_str, None, None) {
-            Ok(SongResult::Done) => return Ok(()),
+            Ok(SongResult::Done) => {
+                if let Some(cfg) = &remote_cfg {
+                    let result = remote::download_song_outputs(cfg, file_hash, cache);
+                    remote::delete_work(cfg, file_hash);
+                    result?;
+                }
+                return Ok(());
+            }
             Ok(SongResult::Cancelled) => {
                 return Err(NightingaleError::Other("key detection cancelled".into()));
             }
