@@ -124,13 +124,19 @@ a generic "same file, different name" assumption):
   Written to `<WORKDIR>/cache/<hash>_lyrics.json`. `remote_server.py`
   rewrites `cmd["lyrics"]` to that path before calling `run_pipeline`
   whenever the field was present, regardless of Rust's literal value.
-- `PUT /sources/<hash>/transcript` — only when `skip_transcription` is true
-  (the LRC/USDX "stems-only" flow) **and** the local
-  `cache.transcript_path(hash)` file already exists. Body = its raw bytes.
-  Written directly to `<WORKDIR>/cache/<hash>_transcript.json` — this is
-  not referenced by any `analyze` JSON field; `pipeline.py` derives that
-  exact path itself from `output_dir` + `hash`, so simply placing the file
-  there before `analyze` is sent reproduces local behavior exactly.
+- `PUT /sources/<hash>/transcript` — whenever the local
+  `cache.transcript_path(hash)` file already exists, **regardless of
+  `skip_transcription`**. Body = its raw bytes. Written directly to
+  `<WORKDIR>/cache/<hash>_transcript.json` — this is not referenced by any
+  `analyze` JSON field; `pipeline.py`'s very first check in `run_pipeline`
+  is `if transcript_exists and not skip_transcription: ... return` (the
+  "already analyzed, skip" short-circuit), evaluated **before** it even
+  looks at `skip_transcription` for the stems-only branch. Gating the
+  upload on `skip_transcription` would make the remote side see a *missing*
+  transcript in cases where local mode would have seen one and treated it
+  identically either way (short-circuit for a normal reanalysis-race case,
+  or patch-in-place for the stems-only case) — so the upload must mirror
+  local's unconditional existence check, not the flag.
 - `GET /results/<hash>/manifest` — returns `{"files":["<hash>_vocals_...mp3", ...]}`,
   every file in `<WORKDIR>/cache` whose name starts with `<hash>`.
 - `GET /results/<hash>/<file>` — raw bytes of that one file (must start with
@@ -163,8 +169,9 @@ are already dependencies. Python side uses only the stdlib
 - `process_song()` gains, only under remote mode, a pre-step before
   `send_and_monitor`: upload the local audio file always, the
   `cache.lyrics_path(hash)` file when `cmd_json["lyrics"]` is set, and the
-  pre-existing `cache.transcript_path(hash)` file when `skip_transcription`
-  is set and it exists (see §5.2's three `PUT` cases) — via the HTTP bridge;
+  pre-existing `cache.transcript_path(hash)` file whenever it exists locally
+  (independent of `skip_transcription` — see §5.2's three `PUT` cases) — via
+  the HTTP bridge;
   and a post-step after `Done`: fetch the manifest, download every listed
   file into the local `CacheDir`, then `DELETE /work/<hash>`. On upload or
   download failure, treat it like a server crash (same retry-once-then-fail
