@@ -1,5 +1,9 @@
+import json
+import socket
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from remote_server import (
@@ -7,6 +11,7 @@ from remote_server import (
     handle_analyze,
     is_safe_hash,
     is_safe_result_filename,
+    start_http_bridge,
 )
 
 HASH = "ab12" * 16  # 64 hex chars
@@ -130,6 +135,114 @@ class HandleAnalyzeTest(unittest.TestCase):
             run_pipeline_fn=fake_run_pipeline,
         )
         self.assertEqual(calls[1]["lyrics_path"], str(self.workdir.lyrics_path(HASH)))
+
+
+class HttpBridgeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = Workdir(self.tmp.name)
+        self.workdir.ensure()
+        self.server = start_http_bridge("127.0.0.1", 0, self.workdir, "tok")
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def _request(self, method, path, body=None, token="tok"):
+        req = urllib.request.Request(self._url(path), data=body, method=method)
+        if token is not None:
+            req.add_header("Authorization", f"Bearer {token}")
+        return urllib.request.urlopen(req)
+
+    def test_upload_and_download_round_trip(self):
+        file_hash = "cd34" * 16
+        self._request("PUT", f"/sources/{file_hash}?ext=mp3", body=b"audio bytes")
+        self.assertEqual(
+            self.workdir.find_source(file_hash).read_bytes(), b"audio bytes"
+        )
+
+        # Simulate the pipeline having produced a result file directly.
+        (self.workdir.cache / f"{file_hash}_vocals.mp3").write_bytes(b"vocals!")
+
+        manifest = json.loads(
+            self._request("GET", f"/results/{file_hash}/manifest").read()
+        )
+        self.assertEqual(manifest["files"], [f"{file_hash}_vocals.mp3"])
+
+        downloaded = self._request(
+            "GET", f"/results/{file_hash}/{file_hash}_vocals.mp3"
+        ).read()
+        self.assertEqual(downloaded, b"vocals!")
+
+        self._request("DELETE", f"/work/{file_hash}")
+        self.assertIsNone(self.workdir.find_source(file_hash))
+
+    def test_missing_token_is_rejected(self):
+        file_hash = "ef56" * 16
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request("PUT", f"/sources/{file_hash}?ext=mp3", body=b"x", token=None)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_wrong_token_is_rejected(self):
+        file_hash = "ef56" * 16
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request(
+                "PUT", f"/sources/{file_hash}?ext=mp3", body=b"x", token="wrong"
+            )
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_path_traversal_hash_is_rejected(self):
+        # urlparse does not collapse ".." segments, so this literal path has
+        # more segments than the /sources/<hash> route expects and falls
+        # through to the generic 404 rather than the hash-specific 400 --
+        # either way, no file is ever written because is_safe_hash() is
+        # never even reached for a path shape that doesn't match a route.
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request("PUT", "/sources/../../etc?ext=mp3", body=b"x")
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_path_traversal_result_filename_is_rejected(self):
+        # Same reasoning as test_path_traversal_hash_is_rejected: the extra
+        # ".." segments push this past the 3-part /results/<hash>/<name>
+        # shape, so it 404s instead of 400ing -- the file is still never
+        # read because the handler never reaches is_safe_result_filename().
+        file_hash = "ef56" * 16
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request("GET", f"/results/{file_hash}/../../etc/passwd")
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_incomplete_upload_body_is_rejected(self):
+        # Review Focus: a connection dropped mid-upload must not leave a
+        # silently truncated file on disk. urllib always sends the full body
+        # it was given, so this needs a raw socket that claims a
+        # Content-Length larger than what it actually sends.
+        file_hash = "9a8b" * 16
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        request_head = (
+            f"PUT /sources/{file_hash}?ext=mp3 HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer tok\r\n"
+            f"Content-Length: 1000\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        conn.sendall(request_head)
+        conn.sendall(b"only ten!")  # far fewer than the declared 1000 bytes
+        conn.shutdown(socket.SHUT_WR)
+
+        response = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        conn.close()
+
+        self.assertIn(b" 400 ", response.splitlines()[0])
+        self.assertIsNone(self.workdir.find_source(file_hash))
 
 
 if __name__ == "__main__":

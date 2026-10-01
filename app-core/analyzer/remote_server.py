@@ -116,3 +116,132 @@ def handle_analyze(cmd, workdir, device, run_pipeline_fn):
             kwargs["lyrics_path"] = str(lyrics_path)
 
     run_pipeline_fn(str(audio_path), str(workdir.cache), file_hash, device, **kwargs)
+
+
+import json
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+
+def make_http_handler(workdir, token):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            print(f"[remote-bridge] {self.address_string()} {fmt % args}", flush=True)
+
+        def _authorized(self):
+            return self.headers.get("Authorization") == f"Bearer {token}"
+
+        def _reject(self, code, message):
+            body = json.dumps({"error": message}).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_json(self, payload, code=200):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_bytes(self, data, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_PUT(self):
+            if not self._authorized():
+                return self._reject(401, "unauthorized")
+            parsed = urlparse(self.path)
+            parts = [p for p in parsed.path.split("/") if p]
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            if len(body) != length:
+                # The connection was dropped mid-upload. `rfile.read(n)`
+                # returns whatever arrived before EOF instead of raising, so
+                # this check is what stops a truncated file from ever being
+                # written to disk.
+                return self._reject(400, "incomplete request body")
+
+            if len(parts) == 2 and parts[0] == "sources":
+                file_hash = parts[1]
+                if not is_safe_hash(file_hash):
+                    return self._reject(400, "invalid hash")
+                ext = parse_qs(parsed.query).get("ext", ["bin"])[0]
+                if not re.fullmatch(r"[A-Za-z0-9]{1,8}", ext):
+                    return self._reject(400, "invalid ext")
+                workdir.ensure()
+                workdir.source_path(file_hash, ext).write_bytes(body)
+                return self._send_json({"ok": True})
+
+            if len(parts) == 3 and parts[0] == "sources" and parts[2] == "lyrics":
+                file_hash = parts[1]
+                if not is_safe_hash(file_hash):
+                    return self._reject(400, "invalid hash")
+                workdir.ensure()
+                workdir.lyrics_path(file_hash).write_bytes(body)
+                return self._send_json({"ok": True})
+
+            if len(parts) == 3 and parts[0] == "sources" and parts[2] == "transcript":
+                file_hash = parts[1]
+                if not is_safe_hash(file_hash):
+                    return self._reject(400, "invalid hash")
+                workdir.ensure()
+                workdir.transcript_path(file_hash).write_bytes(body)
+                return self._send_json({"ok": True})
+
+            self._reject(404, "not found")
+
+        def do_GET(self):
+            if not self._authorized():
+                return self._reject(401, "unauthorized")
+            parsed = urlparse(self.path)
+            parts = [p for p in parsed.path.split("/") if p]
+
+            if len(parts) == 3 and parts[0] == "results" and parts[2] == "manifest":
+                file_hash = parts[1]
+                if not is_safe_hash(file_hash):
+                    return self._reject(400, "invalid hash")
+                return self._send_json({"files": workdir.result_files(file_hash)})
+
+            if len(parts) == 3 and parts[0] == "results":
+                file_hash, name = parts[1], parts[2]
+                if not is_safe_hash(file_hash) or not is_safe_result_filename(
+                    file_hash, name
+                ):
+                    return self._reject(400, "invalid request")
+                path = workdir.cache / name
+                if not path.is_file():
+                    return self._reject(404, "not found")
+                return self._send_bytes(path.read_bytes())
+
+            self._reject(404, "not found")
+
+        def do_DELETE(self):
+            if not self._authorized():
+                return self._reject(401, "unauthorized")
+            parsed = urlparse(self.path)
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 2 and parts[0] == "work":
+                file_hash = parts[1]
+                if not is_safe_hash(file_hash):
+                    return self._reject(400, "invalid hash")
+                workdir.delete_work(file_hash)
+                return self._send_json({"ok": True})
+            self._reject(404, "not found")
+
+    return Handler
+
+
+def start_http_bridge(bind, port, workdir, token):
+    server = ThreadingHTTPServer((bind, port), make_http_handler(workdir, token))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
