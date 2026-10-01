@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -166,12 +166,41 @@ fn read_ready_handshake<R: BufRead>(reader: &mut R) -> Result<ReadyHandshake, Ni
 }
 
 fn connect_and_authenticate(
+    host: &str,
     port: u16,
     token: &str,
 ) -> Result<(BufReader<TcpStream>, BufWriter<TcpStream>), NightingaleError> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT).map_err(|e| {
-        NightingaleError::Other(format!("Failed to connect to analyzer server: {e}"))
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| NightingaleError::Other(format!("failed to resolve {host}:{port}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(NightingaleError::Other(format!(
+            "no addresses found for {host}:{port}"
+        )));
+    }
+    // A hostname can resolve to several addresses (e.g. "localhost" often
+    // resolves to ::1 before 127.0.0.1) and only one family may actually have
+    // something listening, so try every candidate instead of just the first.
+    let mut last_err = None;
+    let mut connected = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, HANDSHAKE_TIMEOUT) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let stream = connected.ok_or_else(|| {
+        NightingaleError::Other(format!(
+            "Failed to connect to analyzer server at {host}:{port}: {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no addresses succeeded".to_string())
+        ))
     })?;
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -279,7 +308,7 @@ fn spawn_server() -> Result<ServerProcess, NightingaleError> {
         info!("[analyzer] Handshake ok: port={}", handshake.port);
     }
 
-    let (reader, writer) = match connect_and_authenticate(handshake.port, &handshake.token) {
+    let (reader, writer) = match connect_and_authenticate("127.0.0.1", handshake.port, &handshake.token) {
         Ok(pair) => pair,
         Err(e) => {
             let _ = child.kill();
@@ -1331,5 +1360,44 @@ fn send_and_monitor(
                 warn!("[analyzer] Ignoring unknown event: {line}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::net::TcpListener;
+
+    fn start_fake_server(expected_token: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(value["type"], "hello");
+            assert_eq!(value["token"], expected_token);
+            writer.write_all(b"{\"type\":\"hello_ack\"}\n").unwrap();
+            writer.flush().unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn connects_and_authenticates_over_loopback_ip() {
+        let port = start_fake_server("secret-token");
+        let result = connect_and_authenticate("127.0.0.1", port, "secret-token");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn connects_and_authenticates_over_hostname() {
+        let port = start_fake_server("secret-token");
+        let result = connect_and_authenticate("localhost", port, "secret-token");
+        assert!(result.is_ok());
     }
 }
