@@ -999,6 +999,31 @@ fn process_song(initial_hash: &str, cache: &CacheDir) {
             return;
         }
     };
+
+    let remote_cfg = match remote::resolve_mode() {
+        Ok(remote::AnalyzerMode::Remote(cfg)) => Some(cfg),
+        Ok(remote::AnalyzerMode::Local) => None,
+        Err(e) => {
+            if !discard_cancelled_job(initial_hash, file_hash) {
+                update_queue_status(file_hash, QueuedStatus::Failed(e.to_string()));
+            }
+            return;
+        }
+    };
+
+    if let Some(cfg) = &remote_cfg {
+        let lyrics_ref = lyrics_path.as_deref();
+        if let Err(e) = remote::upload_song_inputs(cfg, file_hash, &local_path, lyrics_ref, cache) {
+            if !discard_cancelled_job(initial_hash, file_hash) {
+                update_queue_status(
+                    file_hash,
+                    QueuedStatus::Failed(format!("remote upload failed: {e}")),
+                );
+            }
+            return;
+        }
+    }
+
     let mut retried = false;
 
     loop {
@@ -1038,7 +1063,21 @@ fn process_song(initial_hash: &str, cache: &CacheDir) {
                     lock_unpoisoned(&STEMS_ONLY).remove(initial_hash);
                     lock_unpoisoned(&STEMS_ONLY).remove(file_hash);
                     *guard = None;
+                    if let Some(cfg) = &remote_cfg {
+                        remote::delete_work(cfg, file_hash);
+                    }
                 } else {
+                    if let Some(cfg) = &remote_cfg {
+                        if let Err(e) = remote::download_song_outputs(cfg, file_hash, cache) {
+                            remote::delete_work(cfg, file_hash);
+                            update_queue_status(
+                                file_hash,
+                                QueuedStatus::Failed(format!("remote download failed: {e}")),
+                            );
+                            return;
+                        }
+                        remote::delete_work(cfg, file_hash);
+                    }
                     finalize_song(file_hash, cache);
                 }
                 return;
@@ -1046,6 +1085,9 @@ fn process_song(initial_hash: &str, cache: &CacheDir) {
             Ok(SongResult::Cancelled) => {
                 let _ = discard_cancelled_job(initial_hash, file_hash);
                 *guard = None;
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 return;
             }
             Ok(SongResult::Oom) => {
@@ -1058,16 +1100,25 @@ fn process_song(initial_hash: &str, cache: &CacheDir) {
                     update_queue_status(file_hash, QueuedStatus::Analyzing(0));
                     continue;
                 }
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 update_queue_status(file_hash, QueuedStatus::Failed("CUDA out of memory".into()));
                 return;
             }
             Ok(SongResult::Error(msg)) => {
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 update_queue_status(file_hash, QueuedStatus::Failed(msg));
                 return;
             }
             Err(e) => {
                 if discard_cancelled_job(initial_hash, file_hash) {
                     *guard = None;
+                    if let Some(cfg) = &remote_cfg {
+                        remote::delete_work(cfg, file_hash);
+                    }
                     return;
                 }
 
@@ -1079,6 +1130,9 @@ fn process_song(initial_hash: &str, cache: &CacheDir) {
                     info!("[analyzer] Respawning server and retrying");
                     update_queue_status(file_hash, QueuedStatus::Analyzing(0));
                     continue;
+                }
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
                 }
                 update_queue_status(
                     file_hash,
