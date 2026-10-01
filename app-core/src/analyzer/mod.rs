@@ -86,22 +86,29 @@ static SERVER_PID: AtomicU32 = AtomicU32::new(0);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ServerProcess {
-    child: Child,
+    /// `None` in remote mode: there is no local child process to kill, only
+    /// a TCP connection to a long-lived LAN daemon that outlives this app.
+    child: Option<Child>,
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let pid = self.child.id();
-        info!("[analyzer] Killing server process (pid={pid})");
+        if let Some(child) = &self.child {
+            info!("[analyzer] Killing server process (pid={})", child.id());
+        } else {
+            info!("[analyzer] Closing remote analyzer connection");
+        }
         SERVER_PID.store(0, Ordering::SeqCst);
         lock_unpoisoned(&SERVER_INTERRUPT).take();
         if let Ok(stream) = self.writer.get_ref().try_clone() {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -238,7 +245,7 @@ fn connect_and_authenticate(
     Ok((reader, writer))
 }
 
-fn spawn_server() -> Result<ServerProcess, NightingaleError> {
+fn spawn_local_server() -> Result<ServerProcess, NightingaleError> {
     let python = python_path();
     let script = analyzer_dir().join("server.py");
     let models = models_dir();
@@ -335,10 +342,37 @@ fn spawn_server() -> Result<ServerProcess, NightingaleError> {
     }
 
     Ok(ServerProcess {
-        child,
+        child: Some(child),
         reader,
         writer,
     })
+}
+
+fn spawn_remote_server(cfg: &remote::RemoteConfig) -> Result<ServerProcess, NightingaleError> {
+    info!(
+        "[analyzer] Connecting to remote analyzer at {}:{}",
+        cfg.host, cfg.port
+    );
+    let (reader, writer) = connect_and_authenticate(&cfg.host, cfg.port, &cfg.token)?;
+
+    let interrupt = writer
+        .get_ref()
+        .try_clone()
+        .map_err(NightingaleError::from)?;
+    *lock_unpoisoned(&SERVER_INTERRUPT) = Some(interrupt);
+
+    Ok(ServerProcess {
+        child: None,
+        reader,
+        writer,
+    })
+}
+
+fn spawn_server() -> Result<ServerProcess, NightingaleError> {
+    match remote::resolve_mode()? {
+        remote::AnalyzerMode::Local => spawn_local_server(),
+        remote::AnalyzerMode::Remote(cfg) => spawn_remote_server(&cfg),
+    }
 }
 
 fn ensure_server(
