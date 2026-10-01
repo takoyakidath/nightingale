@@ -77,6 +77,8 @@ impl AnalysisQueue {
 }
 use crate::vendor::{analyzer_dir, ffmpeg_path, python_path, silent_command};
 
+mod remote;
+
 // ─── Server process ──────────────────────────────────────────────────
 
 static SERVER_PID: AtomicU32 = AtomicU32::new(0);
