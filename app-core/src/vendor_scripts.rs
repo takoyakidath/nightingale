@@ -2,6 +2,7 @@ use std::path::Path;
 
 const ANALYZE_PY: &str = include_str!("../analyzer/analyze.py");
 const SERVER_PY: &str = include_str!("../analyzer/server.py");
+const REMOTE_SERVER_PY: &str = include_str!("../analyzer/remote_server.py");
 const PIPELINE_PY: &str = include_str!("../analyzer/pipeline.py");
 const KEY_DETECT_PY: &str = include_str!("../analyzer/key_detect.py");
 const STEMS_PY: &str = include_str!("../analyzer/stems.py");
@@ -20,6 +21,7 @@ const CJK_PY: &str = include_str!("../analyzer/cjk.py");
 const FILES: &[(&str, &str)] = &[
     ("analyze.py", ANALYZE_PY),
     ("server.py", SERVER_PY),
+    ("remote_server.py", REMOTE_SERVER_PY),
     ("pipeline.py", PIPELINE_PY),
     ("key_detect.py", KEY_DETECT_PY),
     ("stems.py", STEMS_PY),
@@ -44,4 +46,34 @@ pub(crate) fn write_scripts(dir: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_scripts_extracts_remote_server_py() {
+        let tmp = std::env::temp_dir().join("nightingale-vendor-scripts-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_scripts(&tmp).unwrap();
+
+        let content = std::fs::read_to_string(tmp.join("remote_server.py")).unwrap();
+        assert!(content.contains("NIGHTINGALE_ANALYZER_BIND"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_scripts_extracts_every_registered_file() {
+        let tmp = std::env::temp_dir().join("nightingale-vendor-scripts-test-2");
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_scripts(&tmp).unwrap();
+
+        for (name, _) in FILES {
+            assert!(tmp.join(name).is_file(), "missing extracted file: {name}");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
