@@ -78,8 +78,16 @@ use crate::cache::CacheDir;
 
 static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     let config = ureq::Agent::config_builder()
+        // Governs unreachable-host detection (connection refused/firewalled
+        // fails almost immediately regardless of this value; this just
+        // bounds the wait when a host is reachable but slow to accept).
         .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(120)))
+        // ureq's timeout_global covers the whole request including reading
+        // the response body, so this must be generous enough for a large
+        // lossless source file over a weak LAN link (e.g. Wi-Fi), not just
+        // a liveness check -- 120s previously failed real uploads outright
+        // on slow connections.
+        .timeout_global(Some(Duration::from_secs(1800)))
         .build();
     ureq::Agent::new_with_config(config)
 });
@@ -152,6 +160,14 @@ pub(crate) fn upload_transcript(
 /// daemon to see before sending `analyze`: the audio always, the lyrics file
 /// when one was fetched, and the pre-existing transcript whenever it exists
 /// locally (not gated on `skip_transcription` — see spec §5.2).
+///
+/// Starts by deleting any remote scratch left over from a previous attempt
+/// for this hash. The post-job cleanup in `process_song`/`run_key_pass` is
+/// best-effort (a crash, a cancelled connection, or a swallowed error can
+/// all skip it), so without this pre-job wipe a stale remote transcript or
+/// stem file could make the remote pipeline's "already analyzed, skip"
+/// short-circuit silently return a previous analysis's output for a fresh
+/// reanalyze request.
 pub(crate) fn upload_song_inputs(
     cfg: &RemoteConfig,
     hash: &str,
@@ -159,6 +175,8 @@ pub(crate) fn upload_song_inputs(
     lyrics_path: Option<&Path>,
     cache: &CacheDir,
 ) -> Result<(), NightingaleError> {
+    delete_work(cfg, hash);
+
     let ext = audio_path
         .extension()
         .and_then(|e| e.to_str())
@@ -184,7 +202,10 @@ struct Manifest {
     files: Vec<String>,
 }
 
-pub(crate) fn fetch_manifest(cfg: &RemoteConfig, hash: &str) -> Result<Vec<String>, NightingaleError> {
+pub(crate) fn fetch_manifest(
+    cfg: &RemoteConfig,
+    hash: &str,
+) -> Result<Vec<String>, NightingaleError> {
     let url = format!("{}/results/{hash}/manifest", base_url(cfg));
     let manifest: Manifest = HTTP_AGENT
         .get(&url)
@@ -251,6 +272,7 @@ pub(crate) fn delete_work(cfg: &RemoteConfig, hash: &str) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -356,10 +378,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod http_tests {
     use super::*;
     use crate::cache::CacheDir;
-    use std::io::Read;
     use std::sync::{Arc, Mutex};
     use tiny_http::{Method, Response, Server};
 
@@ -401,7 +423,12 @@ mod http_tests {
             let auth = request
                 .headers()
                 .iter()
-                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                .find(|h| {
+                    h.field
+                        .as_str()
+                        .as_str()
+                        .eq_ignore_ascii_case("authorization")
+                })
                 .map(|h| h.value.as_str().to_string());
             let mut body = Vec::new();
             let mut request = request;
@@ -432,15 +459,64 @@ mod http_tests {
             let request = server.recv().unwrap();
             assert_eq!(request.url(), format!("/results/{HASH}/manifest"));
             request
-                .respond(Response::from_string(
-                    format!("{{\"files\":[\"{HASH}_transcript.json\"]}}"),
-                ))
+                .respond(Response::from_string(format!(
+                    "{{\"files\":[\"{HASH}_transcript.json\"]}}"
+                )))
                 .unwrap();
         });
 
         let files = fetch_manifest(&cfg, HASH).unwrap();
         handle.join().unwrap();
         assert_eq!(files, vec![format!("{HASH}_transcript.json")]);
+    }
+
+    #[test]
+    fn upload_lyrics_puts_bytes_to_lyrics_route() {
+        // Review finding (Important #6): the lyrics PUT route had zero
+        // HTTP-level coverage (only the audio PUT was exercised).
+        let (cfg, server) = fake_bridge("tok");
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            assert_eq!(request.url(), format!("/sources/{HASH}/lyrics"));
+            request
+                .respond(Response::from_string("{\"ok\":true}"))
+                .unwrap();
+        });
+
+        let tmp = std::env::temp_dir().join(format!("nightingale-test-lyrics-{HASH}.json"));
+        fs::write(&tmp, b"{\"lines\":[]}").unwrap();
+
+        let result = upload_lyrics(&cfg, HASH, &tmp);
+        handle.join().unwrap();
+        let _ = fs::remove_file(&tmp);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn upload_fails_when_bridge_rejects_the_token() {
+        // Review finding (Important #6): nothing pinned that a 401 from the
+        // bridge becomes an Err on the Rust side rather than being treated
+        // as a successful upload -- this holds today only because ureq
+        // defaults to treating non-2xx as an error.
+        let (cfg, server) = fake_bridge("wrong-token-on-client-side");
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request
+                .respond(
+                    Response::from_string("{\"error\":\"unauthorized\"}").with_status_code(401),
+                )
+                .unwrap();
+        });
+
+        let tmp = std::env::temp_dir().join(format!("nightingale-test-401-{HASH}.mp3"));
+        fs::write(&tmp, b"audio").unwrap();
+
+        let result = upload_source_audio(&cfg, HASH, "mp3", &tmp);
+        handle.join().unwrap();
+        let _ = fs::remove_file(&tmp);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -497,7 +573,9 @@ mod http_tests {
             let request = server.recv().unwrap();
             assert_eq!(request.method(), &Method::Delete);
             assert_eq!(request.url(), format!("/work/{HASH}"));
-            request.respond(Response::from_string("{\"ok\":true}")).unwrap();
+            request
+                .respond(Response::from_string("{\"ok\":true}"))
+                .unwrap();
         });
         delete_work(&cfg, HASH);
         handle.join().unwrap();
@@ -507,15 +585,27 @@ mod http_tests {
     fn upload_song_inputs_skips_lyrics_and_transcript_when_absent() {
         let (cfg, server) = fake_bridge("tok");
         let handle = std::thread::spawn(move || {
-            // Only the audio PUT should arrive; nothing for lyrics/transcript.
+            // First the pre-job cleanup DELETE, then only the audio PUT --
+            // nothing for lyrics/transcript.
+            let delete_req = server.recv().unwrap();
+            assert_eq!(delete_req.method(), &Method::Delete);
+            assert_eq!(delete_req.url(), format!("/work/{HASH}"));
+            delete_req
+                .respond(Response::from_string("{\"ok\":true}"))
+                .unwrap();
+
             let request = server.recv().unwrap();
             assert_eq!(request.url(), format!("/sources/{HASH}?ext=mp3"));
-            request.respond(Response::from_string("{\"ok\":true}")).unwrap();
+            request
+                .respond(Response::from_string("{\"ok\":true}"))
+                .unwrap();
         });
 
         let tmp_dir = std::env::temp_dir().join(format!("nightingale-test-cache-{HASH}"));
         fs::create_dir_all(&tmp_dir).unwrap();
-        let cache = CacheDir { path: tmp_dir.clone() };
+        let cache = CacheDir {
+            path: tmp_dir.clone(),
+        };
         let audio = tmp_dir.join("audio.mp3");
         fs::write(&audio, b"audio").unwrap();
 
@@ -524,5 +614,60 @@ mod http_tests {
         let _ = fs::remove_dir_all(&tmp_dir);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn upload_song_inputs_deletes_remote_work_before_uploading_transcript() {
+        // Review finding (Critical #1): the remote scratch directory must be
+        // wiped before a job starts, not only after one ends -- otherwise a
+        // stale transcript/stems from a previous attempt can make the remote
+        // pipeline's "already analyzed, skip" short-circuit silently return
+        // old results for a fresh reanalysis. This proves upload_song_inputs
+        // issues the DELETE before any PUT, including the transcript upload.
+        let (cfg, server) = fake_bridge("tok");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        // Not joined: it idles out on its own recv_timeout once
+        // upload_song_inputs (which blocks on each round trip) has returned.
+        let _handle = std::thread::spawn(move || {
+            loop {
+                match server.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Some(request)) => {
+                        seen_clone.lock().unwrap().push(format!(
+                            "{:?} {}",
+                            request.method(),
+                            request.url()
+                        ));
+                        request
+                            .respond(Response::from_string("{\"ok\":true}"))
+                            .unwrap();
+                    }
+                    _ => return,
+                }
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("nightingale-test-cache2-{HASH}"));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let cache = CacheDir {
+            path: tmp_dir.clone(),
+        };
+        let audio = tmp_dir.join("audio.mp3");
+        fs::write(&audio, b"audio").unwrap();
+        fs::write(cache.transcript_path(HASH), b"{}").unwrap();
+
+        let result = upload_song_inputs(&cfg, HASH, &audio, None, &cache);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        assert!(result.is_ok());
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(
+            requests,
+            vec![
+                format!("Delete /work/{HASH}"),
+                format!("Put /sources/{HASH}?ext=mp3"),
+                format!("Put /sources/{HASH}/transcript"),
+            ]
+        );
     }
 }

@@ -315,15 +315,16 @@ fn spawn_local_server() -> Result<ServerProcess, NightingaleError> {
         info!("[analyzer] Handshake ok: port={}", handshake.port);
     }
 
-    let (reader, writer) = match connect_and_authenticate("127.0.0.1", handshake.port, &handshake.token) {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            SERVER_PID.store(0, Ordering::SeqCst);
-            return Err(e);
-        }
-    };
+    let (reader, writer) =
+        match connect_and_authenticate("127.0.0.1", handshake.port, &handshake.token) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                SERVER_PID.store(0, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
 
     let interrupt = match writer.get_ref().try_clone() {
         Ok(stream) => stream,
@@ -1285,6 +1286,9 @@ fn run_key_pass(
                 return Ok(());
             }
             Ok(SongResult::Cancelled) => {
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 return Err(NightingaleError::Other("key detection cancelled".into()));
             }
             Ok(SongResult::Oom) | Err(_) => {
@@ -1293,9 +1297,15 @@ fn run_key_pass(
                     retried = true;
                     continue;
                 }
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 return Err(NightingaleError::Other("key detection failed".into()));
             }
             Ok(SongResult::Error(msg)) => {
+                if let Some(cfg) = &remote_cfg {
+                    remote::delete_work(cfg, file_hash);
+                }
                 return Err(NightingaleError::Other(msg));
             }
         }
@@ -1467,6 +1477,7 @@ fn send_and_monitor(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::{BufRead, Write};

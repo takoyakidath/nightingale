@@ -49,6 +49,7 @@ pub(crate) fn write_scripts(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

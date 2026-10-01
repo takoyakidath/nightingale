@@ -90,11 +90,17 @@ class Workdir:
                     p.unlink()
 
 
-def handle_analyze(cmd, workdir, device, run_pipeline_fn):
+def handle_analyze(cmd, workdir, device, run_pipeline_fn, pre_align_cleanup=None, free_gpu_fn=None):
     """Resolve the client's analyze command against the workdir and run the
     pipeline. Split out from the socket-handling loop (Task 7) so it is
     testable with a fake `run_pipeline_fn` -- no torch/whisper import
-    required here."""
+    required here.
+
+    `pre_align_cleanup`/`free_gpu_fn` are forwarded to `run_pipeline_fn`
+    unchanged when given (server.py passes `end_of_song_cleanup`/
+    `hard_free_gpu` so memory is released between pipeline phases); omitted
+    entirely when not given, matching the `lyrics_path` pattern below, so
+    this function's own tests never need the real gpu module imported."""
     file_hash = cmd["hash"]
     audio_path = workdir.find_source(file_hash)
     if audio_path is None:
@@ -115,6 +121,10 @@ def handle_analyze(cmd, workdir, device, run_pipeline_fn):
         lyrics_path = workdir.lyrics_path(file_hash)
         if lyrics_path.is_file():
             kwargs["lyrics_path"] = str(lyrics_path)
+    if pre_align_cleanup is not None:
+        kwargs["pre_align_cleanup"] = pre_align_cleanup
+    if free_gpu_fn is not None:
+        kwargs["free_gpu_fn"] = free_gpu_fn
 
     run_pipeline_fn(str(audio_path), str(workdir.cache), file_hash, device, **kwargs)
 
@@ -259,6 +269,23 @@ def _send(wfile, payload):
         print(f"[remote-analyzer] failed to send message: {e}", file=sys.stderr, flush=True)
 
 
+def _make_progress_sink(wfile):
+    """Builds the callback passed to whisper_compat.set_progress_sink.
+
+    Deliberately does NOT swallow write errors the way _send() does: a dead
+    connection (the client cancelled and shut down its end) must abort the
+    pipeline at the next progress checkpoint, not run silently to
+    completion. progress() calls this with no try/except of its own, so a
+    raised exception here propagates straight out of run_pipeline.
+    """
+
+    def sink(pct, msg):
+        wfile.write(json.dumps({"type": "progress", "pct": int(pct), "msg": str(msg)}) + "\n")
+        wfile.flush()
+
+    return sink
+
+
 def bind_control_socket(bind, port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -267,7 +294,17 @@ def bind_control_socket(bind, port):
     return srv
 
 
-def serve_control(srv, token, workdir, device):
+# How long a session may sit between client messages before the daemon gives
+# up on it. Only applies to idle gaps (waiting for the next command) -- an
+# in-flight analyze command blocks this same thread inside the pipeline
+# call, not inside a socket read, so a long-running analysis is never cut
+# short by this. Without it, a Surface that sleeps or drops off Wi-Fi
+# without a clean TCP close left the single-session daemon blocked
+# indefinitely, needing a manual restart to serve the next job.
+SESSION_IDLE_TIMEOUT_SECS = 3600
+
+
+def serve_control(srv, token, workdir, device, idle_timeout=SESSION_IDLE_TIMEOUT_SECS):
     bind, port = srv.getsockname()
     print(f"[remote-analyzer] control listening on {bind}:{port}", flush=True)
     while True:
@@ -277,15 +314,15 @@ def serve_control(srv, token, workdir, device):
             return  # socket was closed (e.g. test teardown)
         print(f"[remote-analyzer] client connected from {addr}", flush=True)
         try:
-            handle_session(conn, token, workdir, device)
+            handle_session(conn, token, workdir, device, idle_timeout=idle_timeout)
         except Exception as e:
             print(f"[remote-analyzer] session error: {e}", file=sys.stderr, flush=True)
         finally:
             conn.close()
 
 
-def handle_session(conn, token, workdir, device):
-    conn.settimeout(None)
+def handle_session(conn, token, workdir, device, idle_timeout=SESSION_IDLE_TIMEOUT_SECS):
+    conn.settimeout(idle_timeout)
     rfile = conn.makefile("r", encoding="utf-8", newline="\n")
     wfile = conn.makefile("w", encoding="utf-8", newline="\n")
 
@@ -319,17 +356,30 @@ def _run_analyze_command(cmd, workdir, device, wfile):
     # Imported here, not at module scope, so hello/quit/unknown-command
     # sessions never require torch/whisperx to be installed.
     from pipeline import run_pipeline
-    from gpu import end_of_song_cleanup, log_vram, reset_peak_stats
-    from whisper_compat import is_oom, set_progress_sink
+    from gpu import end_of_song_cleanup, hard_free_gpu, log_vram, reset_peak_stats
+    from whisper_compat import is_oom, set_align_backend, set_progress_sink
+    from audio import set_vocal_threshold_pct
 
-    set_progress_sink(
-        lambda pct, msg: _send(wfile, {"type": "progress", "pct": int(pct), "msg": str(msg)})
-    )
+    # Mirrors server.py's process_song(): these are process-global settings
+    # (not run_pipeline arguments) that local mode applies per analyze
+    # command, so remote mode must set them too or a user's align_backend /
+    # vocal-detection-threshold configuration is silently ignored.
+    set_align_backend(cmd.get("align_backend", "whisperx"))
+    set_vocal_threshold_pct(cmd.get("vocal_detection_threshold_pct"))
+
+    set_progress_sink(_make_progress_sink(wfile))
     try:
         reset_peak_stats()
         log_vram("song_start")
         try:
-            handle_analyze(cmd, workdir, device, run_pipeline)
+            handle_analyze(
+                cmd,
+                workdir,
+                device,
+                run_pipeline,
+                pre_align_cleanup=end_of_song_cleanup,
+                free_gpu_fn=hard_free_gpu,
+            )
         finally:
             end_of_song_cleanup()
             log_vram("song_end")
