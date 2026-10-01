@@ -245,5 +245,87 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIsNone(self.workdir.find_source(file_hash))
 
 
+import threading
+
+from remote_server import bind_control_socket, serve_control
+
+
+class ControlLoopTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = Workdir(self.tmp.name)
+        self.workdir.ensure()
+        self.srv = bind_control_socket("127.0.0.1", 0)
+        self.port = self.srv.getsockname()[1]
+        self.thread = threading.Thread(
+            target=serve_control,
+            args=(self.srv, "tok", self.workdir, "cpu"),
+            daemon=True,
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.srv.close()
+        self.tmp.cleanup()
+
+    def _connect(self):
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        return conn.makefile("r", encoding="utf-8", newline="\n"), conn.makefile(
+            "w", encoding="utf-8", newline="\n"
+        ), conn
+
+    def test_hello_with_correct_token_gets_ack(self):
+        rfile, wfile, conn = self._connect()
+        wfile.write(json.dumps({"type": "hello", "token": "tok"}) + "\n")
+        wfile.flush()
+        response = json.loads(rfile.readline())
+        self.assertEqual(response["type"], "hello_ack")
+        wfile.write(json.dumps({"type": "quit"}) + "\n")
+        wfile.flush()
+        conn.close()
+
+    def test_hello_with_wrong_token_gets_no_ack_and_connection_closes(self):
+        rfile, wfile, conn = self._connect()
+        wfile.write(json.dumps({"type": "hello", "token": "wrong"}) + "\n")
+        wfile.flush()
+        response_line = rfile.readline()
+        self.assertEqual(response_line, "")  # server closed without acking
+        conn.close()
+
+    def test_unknown_command_after_hello_gets_generic_error(self):
+        rfile, wfile, conn = self._connect()
+        wfile.write(json.dumps({"type": "hello", "token": "tok"}) + "\n")
+        wfile.flush()
+        rfile.readline()  # hello_ack
+
+        wfile.write(json.dumps({"type": "bogus"}) + "\n")
+        wfile.flush()
+        response = json.loads(rfile.readline())
+        self.assertEqual(response["type"], "error")
+        self.assertEqual(response["kind"], "generic")
+
+        wfile.write(json.dumps({"type": "quit"}) + "\n")
+        wfile.flush()
+        conn.close()
+
+    def test_daemon_accepts_a_second_session_after_the_first_quits(self):
+        rfile1, wfile1, conn1 = self._connect()
+        wfile1.write(json.dumps({"type": "hello", "token": "tok"}) + "\n")
+        wfile1.flush()
+        rfile1.readline()
+        wfile1.write(json.dumps({"type": "quit"}) + "\n")
+        wfile1.flush()
+        conn1.close()
+
+        rfile2, wfile2, conn2 = self._connect()
+        wfile2.write(json.dumps({"type": "hello", "token": "tok"}) + "\n")
+        wfile2.flush()
+        response = json.loads(rfile2.readline())
+        self.assertEqual(response["type"], "hello_ack")
+        wfile2.write(json.dumps({"type": "quit"}) + "\n")
+        wfile2.flush()
+        conn2.close()
+
+
 if __name__ == "__main__":
     unittest.main()

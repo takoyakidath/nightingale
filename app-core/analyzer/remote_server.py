@@ -245,3 +245,137 @@ def start_http_bridge(bind, port, workdir, token):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
+
+
+import socket
+
+
+def _send(wfile, payload):
+    try:
+        wfile.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        wfile.flush()
+    except (BrokenPipeError, OSError) as e:
+        print(f"[remote-analyzer] failed to send message: {e}", file=sys.stderr, flush=True)
+
+
+def bind_control_socket(bind, port):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((bind, port))
+    srv.listen(5)
+    return srv
+
+
+def serve_control(srv, token, workdir, device):
+    bind, port = srv.getsockname()
+    print(f"[remote-analyzer] control listening on {bind}:{port}", flush=True)
+    while True:
+        try:
+            conn, addr = srv.accept()
+        except OSError:
+            return  # socket was closed (e.g. test teardown)
+        print(f"[remote-analyzer] client connected from {addr}", flush=True)
+        try:
+            handle_session(conn, token, workdir, device)
+        except Exception as e:
+            print(f"[remote-analyzer] session error: {e}", file=sys.stderr, flush=True)
+        finally:
+            conn.close()
+
+
+def handle_session(conn, token, workdir, device):
+    conn.settimeout(None)
+    rfile = conn.makefile("r", encoding="utf-8", newline="\n")
+    wfile = conn.makefile("w", encoding="utf-8", newline="\n")
+
+    hello_line = rfile.readline()
+    if not hello_line:
+        return
+    hello = json.loads(hello_line)
+    if hello.get("type") != "hello" or hello.get("token") != token:
+        print("[remote-analyzer] auth failed, closing connection", file=sys.stderr, flush=True)
+        return
+    _send(wfile, {"type": "hello_ack"})
+
+    for line in rfile:
+        line = line.strip()
+        if not line:
+            continue
+        cmd = json.loads(line)
+        ctype = cmd.get("type")
+        if ctype == "quit":
+            break
+        if ctype != "analyze":
+            _send(
+                wfile,
+                {"type": "error", "kind": "generic", "msg": f"Unknown command: {ctype!r}"},
+            )
+            continue
+        _run_analyze_command(cmd, workdir, device, wfile)
+
+
+def _run_analyze_command(cmd, workdir, device, wfile):
+    # Imported here, not at module scope, so hello/quit/unknown-command
+    # sessions never require torch/whisperx to be installed.
+    from pipeline import run_pipeline
+    from gpu import end_of_song_cleanup, log_vram, reset_peak_stats
+    from whisper_compat import is_oom, set_progress_sink
+
+    set_progress_sink(
+        lambda pct, msg: _send(wfile, {"type": "progress", "pct": int(pct), "msg": str(msg)})
+    )
+    try:
+        reset_peak_stats()
+        log_vram("song_start")
+        try:
+            handle_analyze(cmd, workdir, device, run_pipeline)
+        finally:
+            end_of_song_cleanup()
+            log_vram("song_end")
+        _send(wfile, {"type": "done", "hash": cmd.get("hash", "")})
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        err_str = str(e)
+        kind = "oom" if is_oom(err_str) else "generic"
+        _send(wfile, {"type": "error", "kind": kind, "msg": err_str})
+
+
+def main():
+    from pathlib import Path
+
+    bind = os.environ.get("NIGHTINGALE_ANALYZER_BIND")
+    if not bind:
+        print(
+            "NIGHTINGALE_ANALYZER_BIND is required (an explicit LAN interface IP, "
+            "e.g. 192.168.11.50 -- never 0.0.0.0 or 127.0.0.1 for a real LAN daemon)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    token = os.environ.get("NIGHTINGALE_ANALYZER_TOKEN")
+    if not token:
+        print("NIGHTINGALE_ANALYZER_TOKEN is required", file=sys.stderr)
+        sys.exit(1)
+    port = int(os.environ.get("NIGHTINGALE_ANALYZER_PORT", "8787"))
+    http_port = int(os.environ.get("NIGHTINGALE_ANALYZER_HTTP_PORT", "8788"))
+    workdir_path = os.environ.get(
+        "NIGHTINGALE_ANALYZER_WORKDIR",
+        str(Path.home() / ".nightingale" / "vendor" / "remote_work"),
+    )
+
+    workdir = Workdir(workdir_path)
+    workdir.ensure()
+
+    from whisper_compat import detect_device
+
+    device = detect_device()
+    print(f"[remote-analyzer] device={device} workdir={workdir_path}", flush=True)
+
+    start_http_bridge(bind, http_port, workdir, token)
+    srv = bind_control_socket(bind, port)
+    serve_control(srv, token, workdir, device)
+
+
+if __name__ == "__main__":
+    main()
